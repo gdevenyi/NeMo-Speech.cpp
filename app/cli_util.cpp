@@ -108,6 +108,15 @@ parse_device(const std::string& value, const std::string& option) {
             option + " requested Vulkan, but this build has no Vulkan backend");
 #endif
     }
+    if (value == "npu") {
+#if defined(NEMO_SPEECH_CLI_OPENVINO)
+        // SPIKE: the OpenVINO backend reads this once, at its first initialization.
+        setenv("GGML_OPENVINO_DEVICE", "NPU", 0);
+        return 0;
+#else
+        throw std::invalid_argument(option + " requested NPU, but this build has no OpenVINO backend");
+#endif
+    }
     if (value == "gpu" || value.rfind("gpu:", 0) == 0) {
         if (default_gpu_index() < 0)
             throw std::invalid_argument(option + " requested a GPU, but this is a CPU-only build");

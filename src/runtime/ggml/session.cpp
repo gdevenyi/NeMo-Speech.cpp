@@ -1,3 +1,7 @@
+#include <map>
+#include <cstdio>
+#include <string>
+#include <cmath>
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -709,6 +713,65 @@ Session::read_model_tensor(const std::string& name, void* host_buffer, size_t nb
     ggml_backend_tensor_get(t.tensor, host_buffer, 0, want);
 }
 
+static void spike_dump_outputs(const char* where, ggml_cgraph* gf) {
+    static const char* dir = std::getenv("SPIKE_DUMP_DIR");
+    static int run = 0;
+    if (dir == nullptr || run >= 200)
+        return;
+    ++run;
+    const int n = ggml_graph_n_nodes(gf);
+    ggml_tensor* spike_last = ggml_graph_node(gf, n - 1);
+    if (n < 12 && spike_last->type == GGML_TYPE_I32 && spike_last->data != nullptr) {
+        const int32_t* tok = static_cast<const int32_t*>(spike_last->data);
+        ggml_tensor* lg = spike_last->src[0];
+        const float* l = lg != nullptr && lg->data != nullptr ? static_cast<const float*>(lg->data) : nullptr;
+        fprintf(stderr, "[spike-tok] run=%d tok=%d,%d logit0=%.3f logit1=%.3f blank=%.3f\n", run, tok[0], tok[1],
+                l ? l[tok[0]] : 0.0f, l ? l[lg->ne[0] + tok[1]] : 0.0f, l ? l[lg->ne[0] - 1] : 0.0f);
+    }
+    if (n < 12 && run < 12) {
+        const auto stat = [&](const char* tag, ggml_tensor* x) {
+            if (x->data == nullptr) {
+                fprintf(stderr, "[spike-joint] run=%d %s %s type=%s data=null\n", run, tag, x->name, ggml_type_name(x->type));
+                return;
+            }
+            if (x->type != GGML_TYPE_F32) {
+                fprintf(stderr, "[spike-joint] run=%d %s %s type=%s ne=[%lld,%lld]\n", run, tag, x->name, ggml_type_name(x->type), (long long)x->ne[0], (long long)x->ne[1]);
+                return;
+            }
+            const size_t c = ggml_nelements(x);
+            const float* d = static_cast<const float*>(x->data);
+            double l1 = 0, amax = 0, sum = 0;
+            for (size_t i = 0; i < c; ++i) { sum += d[i]; l1 += std::fabs(d[i]); amax = std::max(amax, static_cast<double>(std::fabs(d[i]))); }
+            fprintf(stderr, "[spike-joint] run=%d %s %s %s ne=[%lld,%lld,%lld,%lld] mean=%.5f l1=%.5f amax=%.5f\n", run, tag, ggml_op_name(x->op), x->name, (long long)x->ne[0], (long long)x->ne[1], (long long)x->ne[2], (long long)x->ne[3], sum / c, l1 / c, amax);
+        };
+        for (int i = 0; i < n; ++i) {
+            ggml_tensor* node = ggml_graph_node(gf, i);
+            stat("node", node);
+            for (int j = 0; j < GGML_MAX_SRC && node->src[j]; ++j)
+                if (node->src[j]->op == GGML_OP_NONE)
+                    stat(" src", node->src[j]);
+        }
+    }
+    // Last node of each graph: encoder output tail, predictor state, or joint logits.
+    ggml_tensor* t = ggml_graph_node(gf, n - 1);
+    if (t->type != GGML_TYPE_F32 || t->data == nullptr)
+        return;
+    const size_t count = ggml_nelements(t);
+    const float* d = static_cast<const float*>(t->data);
+    double sum = 0, amax = 0, l1 = 0;
+    for (size_t i = 0; i < count; ++i) {
+        sum += d[i];
+        l1 += std::fabs(d[i]);
+        amax = std::max(amax, static_cast<double>(std::fabs(d[i])));
+    }
+    fprintf(stderr, "[spike-dump] run=%d %s nodes=%d name=%s ne=[%lld,%lld,%lld,%lld] mean=%.5f l1=%.5f amax=%.5f\n", run, where, n, t->name, (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3], sum / count, l1 / count, amax);
+    std::string path = std::string(dir) + "/run" + std::to_string(run) + "_n" + std::to_string(n) + ".bin";
+    if (FILE* f = fopen(path.c_str(), "wb")) {
+        fwrite(t->data, 1, ggml_nbytes(t), f);
+        fclose(f);
+    }
+}
+
 void
 Session::run_impl(
     uint64_t key, const std::function<TensorBag(Session*, TensorContainer*)>& define_input_tensors,
@@ -865,6 +928,8 @@ Session::run_impl(
                 GGMLF_LOG_ERROR("Failed to compute graph (direct)\n");
                 throw std::runtime_error("failed to compute graph");
             }
+            ggml_backend_synchronize(cr.direct_backend);
+            spike_dump_outputs("direct", cr.gf);
             auto _t3d = _clk::now();
             const bool host_output_pending =
                 return_output(this, cr.output_tensors, cr.container.get());
@@ -899,6 +964,27 @@ Session::run_impl(
         }
 
         sched_guard.s = sched.get();
+        {
+            // SPIKE: the scheduler rewrites node sources in place to its split copies. Restore
+            // them, or a reused graph with a split reads stale copies.
+            static std::map<ggml_cgraph*, std::vector<ggml_tensor*>> spike_srcs;
+            const int spike_n = ggml_graph_n_nodes(cr.gf);
+            auto spike_it = spike_srcs.find(cr.gf);
+            if (spike_it == spike_srcs.end() || fresh) {
+                auto& saved = spike_srcs[cr.gf];
+                saved.clear();
+                saved.reserve(static_cast<size_t>(spike_n) * GGML_MAX_SRC);
+                for (int i = 0; i < spike_n; ++i) {
+                    ggml_tensor* node = ggml_graph_node(cr.gf, i);
+                    saved.insert(saved.end(), node->src, node->src + GGML_MAX_SRC);
+                }
+            } else {
+                for (int i = 0; i < spike_n; ++i) {
+                    ggml_tensor* node = ggml_graph_node(cr.gf, i);
+                    std::copy_n(spike_it->second.data() + static_cast<size_t>(i) * GGML_MAX_SRC, GGML_MAX_SRC, node->src);
+                }
+            }
+        }
         if (!ggml_backend_sched_alloc_graph(sched.get(), cr.gf)) {
             GGMLF_LOG_ERROR("Failed to allocate graph\n");
             throw std::runtime_error("failed to allocate graph");
@@ -970,6 +1056,8 @@ Session::run_impl(
             GGMLF_LOG_ERROR("Failed to compute graph\n");
             throw std::runtime_error("failed to compute graph");
         }
+        ggml_backend_sched_synchronize(sched.get());
+        spike_dump_outputs("sched", cr.gf);
         auto _t3 = _clk::now();
 
         // Outputs are read before the guard resets the scheduler: in

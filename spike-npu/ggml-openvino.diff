@@ -1,0 +1,256 @@
+diff -ruN llama.cpp/ggml/src/ggml-openvino/ggml-decoder.cpp build-ov/_deps/llama.cpp/ggml/src/ggml-openvino/ggml-decoder.cpp
+--- llama.cpp/ggml/src/ggml-openvino/ggml-decoder.cpp	2026-10-30 07:32:49.572494744 -0400
++++ build-ov/_deps/llama.cpp/ggml/src/ggml-openvino/ggml-decoder.cpp	2026-10-30 21:46:57.197478111 -0400
+@@ -1,3 +1,4 @@
++#include <sstream>
+ #include "ggml-decoder.h"
+ 
+ #include "ggml-impl.h"
+@@ -91,6 +92,7 @@
+     m_cgraph = cgraph;
+     m_model_weights = model_weights;
+     m_naive = true;
++    m_is_static = true;  // SPIKE: enable generic VIEW slices.
+     set_input_output();
+     compute_model_inputs();
+     compute_model_outputs();
+@@ -1208,7 +1210,23 @@
+     for (int node_n = 0; node_n < m_cgraph->n_nodes; node_n++) {
+         auto * cur_node = m_cgraph->nodes[node_n];
+         // if the node op is NONE means this node is not used at all, we can skip it directly without adding to model outputs.
+-        if (cur_node->op == GGML_OP_NONE || cur_node->op == GGML_OP_VIEW || cur_node->op == GGML_OP_RESHAPE) {
++        // SPIKE: a RESHAPE or VIEW that no node uses is a graph output.
++        bool flagged_output = cur_node->op == GGML_OP_VIEW || cur_node->op == GGML_OP_RESHAPE;
++        for (int i = 0; flagged_output && i < m_cgraph->n_nodes; i++) {
++            for (int j = 0; j < GGML_MAX_SRC; j++) {
++                if (m_cgraph->nodes[i]->src[j] == cur_node) {
++                    flagged_output = false;
++                }
++            }
++        }
++        if (cur_node->op == GGML_OP_NONE ||
++            ((cur_node->op == GGML_OP_VIEW || cur_node->op == GGML_OP_RESHAPE) && !flagged_output)) {
++            continue;
++        }
++        if (flagged_output && (cur_node->op == GGML_OP_VIEW || cur_node->op == GGML_OP_RESHAPE)) {
++            std::string flagged_name = get_tensor_ov_name(m_cgraph, cur_node);
++            m_model_outputs[flagged_name] = cur_node;
++            m_model_output_names.insert(flagged_name);
+             continue;
+         }
+         auto cur_node_use_count = m_cgraph->use_counts[ggml_hash_find(&m_cgraph->visited_hash_set, cur_node)];
+@@ -1426,7 +1444,17 @@
+ 
+     OvWeight ov_weight;
+     if (ggml_is_quantized(tensor->type)) {
+-        auto use_bias = naive;
++        const char * spike_bias_name = ggml_openvino_getenv_str("SPIKE_BIAS_NAME");
++        auto use_bias = ggml_openvino_getenv_str("SPIKE_PERF") != nullptr ||
++                        [&] {
++                            if (spike_bias_name == nullptr) return false;
++                            std::stringstream ss(spike_bias_name);
++                            std::string part;
++                            while (std::getline(ss, part, ',')) {
++                                if (strstr(tensor->name, part.c_str()) != nullptr) return true;
++                            }
++                            return false;
++                        }();  // SPIKE: toggle.
+         if (is_ov_buffer) {
+             // For quantized weights, copy raw data to a temp buffer first because
+             // process_weight_tensor reads from data and writes extracted results
+diff -ruN llama.cpp/ggml/src/ggml-openvino/ggml-openvino-extra.cpp build-ov/_deps/llama.cpp/ggml/src/ggml-openvino/ggml-openvino-extra.cpp
+--- llama.cpp/ggml/src/ggml-openvino/ggml-openvino-extra.cpp	2026-10-30 07:32:49.572767222 -0400
++++ build-ov/_deps/llama.cpp/ggml/src/ggml-openvino/ggml-openvino-extra.cpp	2026-10-30 21:44:08.116244917 -0400
+@@ -30,6 +30,11 @@
+     static constexpr const char * env_var_names[] = {
+         // String values (use ggml_openvino_getenv_str)
+         "GGML_OPENVINO_DEVICE",
++        "SPIKE_PERF",
++        "SPIKE_BIAS_NAME",
++        "SPIKE_OUT_DIR",
++        "SPIKE_SMALL_CPU",
++        "SPIKE_PRECISION",
+         "GGML_OPENVINO_CACHE_DIR",
+         "GGML_OPENVINO_SPILL_DIR",
+         "GGML_OPENVINO_DEBUG_NODE",
+diff -ruN llama.cpp/ggml/src/ggml-openvino/openvino/op/reshape.cpp build-ov/_deps/llama.cpp/ggml/src/ggml-openvino/openvino/op/reshape.cpp
+--- llama.cpp/ggml/src/ggml-openvino/openvino/op/reshape.cpp	2026-10-30 07:32:49.574095698 -0400
++++ build-ov/_deps/llama.cpp/ggml/src/ggml-openvino/openvino/op/reshape.cpp	2026-10-30 07:37:39.586277075 -0400
+@@ -24,7 +24,7 @@
+         return {context.get_input(0)};
+     }
+ 
+-    int op_case = context.get_op_case();
++    int op_case = 0;  // SPIKE: ASR graphs have static shapes, so ignore the LLM shape heuristics.
+ 
+     auto output_shape = context.get_output_shape().to_shape();
+     std::shared_ptr<ov::Node> new_shape_node;
+diff -ruN llama.cpp/ggml/src/ggml-openvino/openvino/op/view.cpp build-ov/_deps/llama.cpp/ggml/src/ggml-openvino/openvino/op/view.cpp
+--- llama.cpp/ggml/src/ggml-openvino/openvino/op/view.cpp	2026-10-30 07:32:49.574095698 -0400
++++ build-ov/_deps/llama.cpp/ggml/src/ggml-openvino/openvino/op/view.cpp	2026-10-30 07:43:26.297925851 -0400
+@@ -177,8 +177,9 @@
+ 
+     bool same_stride = (src_stride.size() == dst_stride.size());
+     if (same_stride) {
++        auto dst_for_stride = dst_shape.to_shape();  // SPIKE: strides of size-1 axes do not matter.
+         for (size_t i = 0; i < src_stride.size(); ++i) {
+-            if (src_stride[i] != dst_stride[i]) {
++            if (dst_for_stride[i] > 1 && src_stride[i] != dst_stride[i]) {
+                 same_stride = false;
+                 break;
+             }
+diff -ruN llama.cpp/ggml/src/ggml-openvino/utils.cpp build-ov/_deps/llama.cpp/ggml/src/ggml-openvino/utils.cpp
+--- llama.cpp/ggml/src/ggml-openvino/utils.cpp	2026-10-30 07:32:49.575056554 -0400
++++ build-ov/_deps/llama.cpp/ggml/src/ggml-openvino/utils.cpp	2026-10-30 21:36:48.550667077 -0400
+@@ -1,3 +1,4 @@
++#include <map>
+ #include "utils.h"
+ 
+ #include "ggml-impl.h"
+@@ -557,6 +558,90 @@
+         return GGML_STATUS_SUCCESS;
+     }
+ 
++    struct spike_entry {
++        std::shared_ptr<GgmlOvDecoder> decoder;
++        std::shared_ptr<ov::InferRequest> request;
++        std::vector<std::string> input_names;
++        std::vector<std::string> output_names;
++    };
++    static std::map<uint64_t, spike_entry> spike_cache;
++    uint64_t spike_key = 1469598103934665603ULL;
++    const auto spike_mix = [&](uint64_t v) { spike_key = (spike_key ^ v) * 1099511628211ULL; };
++    spike_mix(cgraph->n_nodes);
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        auto * n = cgraph->nodes[i];
++        spike_mix((uint64_t) (uintptr_t) n);
++        spike_mix((uint64_t) (uintptr_t) n->data);
++        spike_mix(n->op);
++        for (int d = 0; d < GGML_MAX_DIMS; d++) spike_mix(n->ne[d]);
++    }
++    auto spike_it = spike_cache.find(spike_key);
++    if (spike_it != spike_cache.end()) {
++        auto & e = spike_it->second;
++        for (size_t i = 0; i < e.input_names.size(); i++) {
++            e.request->set_input_tensor(i, get_ov_input_tensor(e.decoder, e.input_names[i]));
++        }
++        const int64_t spike_i0 = ggml_time_us();
++        auto spike_busy = [] { long long v = 0; if (FILE * f = fopen("/sys/class/accel/accel0/device/npu_busy_time_us", "r")) { if (fscanf(f, "%lld", &v) != 1) v = 0; fclose(f); } return v; };
++        const long long spike_b0 = spike_busy();
++        e.request->infer();
++        if (const char * spike_dir = ggml_openvino_getenv_str("SPIKE_OUT_DIR"); spike_dir != nullptr && cgraph->n_nodes > 2000) {
++            static int spike_enc_run = 0;
++            spike_enc_run++;
++            if (spike_enc_run == 2 || spike_enc_run == 45 || spike_enc_run == 70) {
++                for (size_t i = 0; i < e.output_names.size(); i++) {
++                    auto t = e.request->get_output_tensor(i);
++                    std::string safe = e.output_names[i];
++                    for (auto & c : safe) {
++                        if (c == '/' || c == ' ' || c == '#') c = '_';
++                    }
++                    std::string path = std::string(spike_dir) + "/r" + std::to_string(spike_enc_run) + "__" + safe + "__" + t.get_element_type().get_type_name() + ".bin";
++                    if (FILE * f = fopen(path.c_str(), "wb")) {
++                        fwrite(t.data(), 1, t.get_byte_size(), f);
++                        fclose(f);
++                    }
++                }
++            }
++        }
++        if (cgraph->n_nodes > 2000) {
++            size_t in_bytes = 0;
++            for (size_t i = 0; i < e.input_names.size(); i++) in_bytes += e.request->get_input_tensor(i).get_byte_size();
++            size_t out_bytes = 0;
++            for (size_t i = 0; i < e.output_names.size(); i++) out_bytes += e.request->get_output_tensor(i).get_byte_size();
++            fprintf(stderr, "[spike-busy] infer_ms=%.0f npu_busy_ms=%.0f in_mb=%.1f out_mb=%.1f\n", (ggml_time_us() - spike_i0) / 1000.0, (spike_busy() - spike_b0) / 1000.0, in_bytes / 1e6, out_bytes / 1e6);
++        }
++        static std::map<int, std::pair<int64_t, int64_t>> spike_times;
++        auto & spike_time = spike_times[cgraph->n_nodes];
++        spike_time.first += ggml_time_us() - spike_i0;
++        if (++spike_time.second % 20 == 0) {
++            fprintf(stderr, "[spike-time] nodes=%d infer_avg_ms=%.0f\n", cgraph->n_nodes, spike_time.first / 1000.0 / spike_time.second);
++        }
++        for (size_t i = 0; i < e.output_names.size(); i++) {
++            auto output_tensor = e.request->get_output_tensor(i);
++            const auto & outs = e.decoder->get_model_outputs();
++            auto it = outs.find(e.output_names[i]);
++            if (it != outs.end()) {
++                std::memcpy(it->second->data, output_tensor.data(), output_tensor.get_byte_size());
++            }
++            static int spike_prints = 0;
++            if (it != outs.end() && (e.output_names.size() < 8 || e.output_names[i].find("cache") == std::string::npos) && spike_prints < 60 && output_tensor.get_element_type() == ov::element::f32) {
++                spike_prints++;
++                const float * d = output_tensor.data<const float>();
++                double sum = 0, amax = 0; size_t nan = 0, n = output_tensor.get_size();
++                for (size_t k = 0; k < n; k++) { if (d[k] != d[k]) nan++; else { sum += d[k]; amax = std::max(amax, (double) std::fabs(d[k])); } }
++                fprintf(stderr, "[spike-out] nodes=%d %s n=%zu mean=%.4f amax=%.4f nan=%zu\n", cgraph->n_nodes, e.output_names[i].c_str(), n, sum / n, amax, nan);
++            }
++        }
++        return GGML_STATUS_SUCCESS;
++    }
++    const int64_t spike_t0 = ggml_time_us();
++    if (cgraph->n_nodes < 12) {
++        for (int i = 0; i < cgraph->n_nodes; i++) {
++            auto * n = cgraph->nodes[i];
++            fprintf(stderr, "[spike-node] %d %s %s [%lld,%lld,%lld,%lld] src0=%s flags=%d view_src=%s\n", i, ggml_op_name(n->op), n->name, (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3], n->src[0] ? n->src[0]->name : "-", n->flags, n->view_src ? n->view_src->name : "-");
++        }
++    }
++
+     std::unique_lock<std::mutex> compile_lock(cache.mutex);
+     bool naive = true;
+     auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph, naive);
+@@ -573,15 +658,22 @@
+     if (cgraph->nodes[0]->op == GGML_OP_MUL_MAT) {
+         // TODO ACCURACY hint triggers a bug in GPU plugin/driver on Lunar Lake. Remove once CVS-182166 is resolved
+         compile_config[ov::hint::execution_mode.name()] = ov::hint::ExecutionMode::PERFORMANCE;
++    } else if (ggml_openvino_getenv_str("SPIKE_PERF")) {  // SPIKE
++        compile_config[ov::hint::execution_mode.name()] = ov::hint::ExecutionMode::PERFORMANCE;
+     } else {
+         compile_config[ov::hint::execution_mode.name()] = ov::hint::ExecutionMode::ACCURACY;
+     }
++    if (const char * spike_precision = ggml_openvino_getenv_str("SPIKE_PRECISION")) {
++        compile_config["INFERENCE_PRECISION_HINT"] = std::string(spike_precision);
++    }
+     if (remote_context.has_value()) {
+         infer_request = std::make_shared<ov::InferRequest>(
+             core.compile_model(model, remote_context.value(), compile_config).create_infer_request());
+     } else {
+         infer_request = std::make_shared<ov::InferRequest>(
+-            core.compile_model(model, device, compile_config).create_infer_request());
++            (ggml_openvino_getenv_str("SPIKE_SMALL_CPU") != nullptr && cgraph->n_nodes < 100 ?
++                 core.compile_model(model, "CPU", ov::AnyMap{}) :
++                 core.compile_model(model, device, compile_config)).create_infer_request());
+     }
+     std::vector<std::string> input_names;
+     std::vector<std::string> output_names;
+@@ -598,6 +690,10 @@
+     decoder->clear_model_weights();
+     model_weights.clear();
+     compile_lock.unlock();
++    fprintf(stderr, "[spike] compiled graph nodes=%d inputs=%zu outputs=%zu device=%s in %.1f ms\n",
++            cgraph->n_nodes, input_names.size(), output_names.size(), device.c_str(),
++            (ggml_time_us() - spike_t0) / 1000.0);
++    spike_cache[spike_key] = {decoder, infer_request, input_names, output_names};
+ 
+     for (size_t i = 0; i < input_names.size(); i++) {
+         const auto & param_name = input_names[i];
+@@ -1571,7 +1667,19 @@
+             count++;
+         }
+     }
+-    return count < naive_graph_size_threshold;
++    if (count < naive_graph_size_threshold) {
++        return true;
++    }
++    // SPIKE: a graph with no inp_pos is not an LLM graph.
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        auto * op = cgraph->nodes[i];
++        for (int j = 0; j < GGML_MAX_SRC && op->src[j] != nullptr; ++j) {
++            if (GgmlOvDecoder::is_inp_pos(op->src[j], op)) {
++                return false;
++            }
++        }
++    }
++    return true;
+ }
+ 
+ size_t checksum(const void * data, size_t size) {

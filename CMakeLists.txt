@@ -231,6 +231,9 @@ endif()
 if(GGML_METAL)
     list(APPEND GGML_DEPENDENCIES ggml-metal)
 endif()
+if(GGML_OPENVINO)
+    list(APPEND GGML_DEPENDENCIES ggml-openvino)
+endif()
 
 # Tiled CPU GEMM (llamafile tinyBLAS) for F16/F32/Q8_0 matmuls. Stock ggml leaves it off; without
 # it CPU matmuls run one dot product per output.

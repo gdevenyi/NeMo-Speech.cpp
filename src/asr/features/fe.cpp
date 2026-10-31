@@ -327,7 +327,10 @@ MelSpectrogramExtractor::MelSpectrogramExtractor(
     init_mel_basis();
     init_cpu_tables();
 
-    if (bm_ != nullptr && bm_->gpu_backend_handle() != nullptr) {
+    // SPIKE: mel stays on the host FFT for the OpenVINO NPU.
+    const bool openvino_gpu = bm_ != nullptr && bm_->gpu_backend_handle() != nullptr &&
+        std::string(ggml_backend_name(bm_->gpu_backend_handle())).find("OPENVINO") != std::string::npos;
+    if (bm_ != nullptr && bm_->gpu_backend_handle() != nullptr && !openvino_gpu) {
         module_ = std::make_unique<FeModule>(cfg_, window_, mel_basis_);
         session_ =
             std::make_unique<ggml_runtime::Session>(*bm_, module_.get(), /*gguf_loader=*/nullptr);
